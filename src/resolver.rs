@@ -274,6 +274,8 @@ mod tests {
                 description: String::new(),
                 license: String::new(),
                 url: String::new(),
+                self_contained: false,
+                bundled: vec![],
                 depends: depends.iter().map(|value| (*value).into()).collect(),
                 optdepends: vec![],
                 package_groups: vec![],

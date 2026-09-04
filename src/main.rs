@@ -94,7 +94,8 @@ fn json_string(value: &str) -> String {
 const USAGE: &str = "usage:
   arc [--root <target>] [--yes] [--non-interactive] [--json] <command> [arguments]
 
-  arc pack <package-root> [output.arc]
+  arc pack [--skip-runtime-audit] <package-root> [output.arc]
+  arc audit <package-root>
   arc inspect <package.arc>
   arc convert-arch <package.pkg.tar.zst> [output.arc]
   arc version <first> <second>
@@ -117,6 +118,7 @@ const USAGE: &str = "usage:
   arc --root <target> files <package>
   arc --root <target> owns <path>
   arc --root <target> info <package>...
+  arc --root <target> bundled <component>
   arc --root <target> search <query>
   arc --root <target> group <group>
   arc --root <target> required-by <package>
@@ -178,6 +180,7 @@ fn run(arguments: Vec<OsString>) -> Result<()> {
     let mut ui = TerminalUi::new();
     match cli.command.as_str() {
         "pack" => pack(&cli.arguments, &ui, &output),
+        "audit" => audit(&cli.arguments, &ui, &output),
         "inspect" => inspect(&cli.arguments, &ui, &output),
         "convert-arch" => convert_arch(&cli.arguments, &ui, &output),
         "version" => compare_versions(&cli.arguments, &output),
@@ -237,6 +240,7 @@ fn run(arguments: Vec<OsString>) -> Result<()> {
         "files" => files(&cli.root, &cli.arguments, &output),
         "owns" => owns(&cli.root, &cli.arguments, &output),
         "info" => info(&cli.root, &cli.arguments, &output),
+        "bundled" => bundled(&cli.root, &cli.arguments, &output),
         "search" => search(&cli.root, &cli.arguments, &output),
         "group" => group(&cli.root, &cli.arguments, &output),
         "required-by" => required_by(&cli.root, &cli.arguments, &output),
@@ -804,6 +808,44 @@ fn info(root: &Path, arguments: &[OsString], output: &Output) -> Result<()> {
     Ok(())
 }
 
+fn bundled(root: &Path, arguments: &[OsString], output: &Output) -> Result<()> {
+    if arguments.len() != 1 {
+        return Err(ArcError::Usage(USAGE.into()));
+    }
+    let component = arguments[0]
+        .to_str()
+        .ok_or_else(|| ArcError::Usage("component name is not valid UTF-8".into()))?;
+    let metadata = if root.join("etc/arc/repos.toml").exists() {
+        remote::catalog_bundled(root, component)?
+            .into_iter()
+            .map(|package| package.metadata)
+            .collect::<Vec<arc::metadata::Metadata>>()
+    } else {
+        Database::new(root)?
+            .load_all()?
+            .into_iter()
+            .map(|record| record.package)
+            .collect::<Vec<arc::metadata::Metadata>>()
+    };
+    let mut found = false;
+    for package in metadata {
+        for bundled in package.bundled.iter().filter(|item| item.name == component) {
+            output.line(format!(
+                "{} {}    {} {}",
+                package.name, package.version, bundled.name, bundled.version
+            ))?;
+            found = true;
+        }
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(ArcError::Usage(format!(
+            "no installed or synchronized package bundles {component}"
+        )))
+    }
+}
+
 fn search(root: &Path, arguments: &[OsString], output: &Output) -> Result<()> {
     if arguments.len() != 1 {
         return Err(ArcError::Usage(USAGE.into()));
@@ -987,15 +1029,46 @@ fn utf8_arguments(arguments: &[OsString], kind: &str) -> Result<Vec<String>> {
 }
 
 fn pack(arguments: &[OsString], ui: &TerminalUi, output: &Output) -> Result<()> {
+    let (skip_runtime_audit, arguments) = match arguments.first().and_then(|value| value.to_str()) {
+        Some("--skip-runtime-audit") => (true, &arguments[1..]),
+        _ => (false, arguments),
+    };
     if !(1..=2).contains(&arguments.len()) {
         return Err(ArcError::Usage(USAGE.into()));
     }
     let source = PathBuf::from(&arguments[0]);
     let destination = arguments.get(1).map(PathBuf::from);
     ui.phase("Validating and packing payload");
-    let package = package::pack(&source, destination.as_deref())?;
+    let package = package::pack_with_options(&source, destination.as_deref(), skip_runtime_audit)?;
     ui.success(&format!("created {}", package.display()));
     output.line(package.display())
+}
+
+fn audit(arguments: &[OsString], ui: &TerminalUi, output: &Output) -> Result<()> {
+    if arguments.len() != 1 {
+        return Err(ArcError::Usage(USAGE.into()));
+    }
+    let root = PathBuf::from(&arguments[0]);
+    let metadata_path = root.join(".arc/meta.toml");
+    let metadata = if metadata_path.is_file() {
+        Some(arc::metadata::Metadata::from_toml(&fs::read_to_string(
+            metadata_path,
+        )?)?)
+    } else {
+        None
+    };
+    ui.phase("Auditing package runtime without executing payload files");
+    let report = arc::runtime_audit::audit_root(&root, metadata.as_ref())?;
+    output.line(arc::runtime_audit::format_report(
+        metadata.as_ref(),
+        &report,
+    ))?;
+    if report.passed() {
+        ui.success("runtime audit passed");
+        Ok(())
+    } else {
+        Err(ArcError::InvalidState("runtime audit failed".into()))
+    }
 }
 
 fn inspect(arguments: &[OsString], ui: &TerminalUi, output: &Output) -> Result<()> {
@@ -1006,6 +1079,20 @@ fn inspect(arguments: &[OsString], ui: &TerminalUi, output: &Output) -> Result<(
     let inspection = package::inspect(&PathBuf::from(&arguments[0]))?;
     ui.success("package is valid");
     output.line(inspection.metadata.to_toml()?)?;
+    output.line(format!(
+        "Self-contained: {}",
+        if inspection.metadata.self_contained {
+            "yes"
+        } else {
+            "no"
+        }
+    ))?;
+    let runtime_dir = format!("usr/lib/arc/{}", inspection.metadata.name);
+    if inspection.members.iter().any(|member| {
+        member.path == runtime_dir || member.path.starts_with(&(runtime_dir.clone() + "/"))
+    }) {
+        output.line(format!("Private runtime: /{runtime_dir}"))?;
+    }
     output.line(format!("sha256 = {:?}", inspection.sha256))?;
     output.line(format!("members = {}", inspection.members.len()))?;
     output.line(format!("payload_size = {}", inspection.payload_size))

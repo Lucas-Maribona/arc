@@ -166,6 +166,8 @@ fn metadata_from_pkginfo(fields: &BTreeMap<String, Vec<String>>) -> Result<Metad
         description: optional("pkgdesc")?,
         license: many("license").join(", "),
         url: optional("url")?,
+        self_contained: false,
+        bundled: vec![],
         depends: many("depend"),
         optdepends: vec![],
         package_groups: vec![],

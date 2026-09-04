@@ -11,6 +11,7 @@ pub mod publisher;
 pub mod remote;
 pub mod repository;
 pub mod resolver;
+pub mod runtime_audit;
 mod system;
 pub mod transaction;
 mod triggers;

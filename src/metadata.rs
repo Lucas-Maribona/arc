@@ -25,6 +25,15 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
 
+    /// Declares that ordinary userspace runtime requirements are carried in
+    /// this package. It is deliberately not a dependency-resolver switch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_contained: bool,
+    /// Software shipped internally for provenance and vulnerability response.
+    /// These records never create install dependencies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundled: Vec<BundledComponent>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -45,6 +54,13 @@ pub struct Metadata {
     pub groups: Vec<SystemGroup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub users: Vec<SystemUser>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundledComponent {
+    pub name: String,
+    pub version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,6 +115,17 @@ impl Metadata {
         validate_name(&self.name)?;
         Version::parse(&self.version)?;
         validate_architecture(&self.arch)?;
+        let mut bundled = HashSet::new();
+        for component in &self.bundled {
+            validate_name(&component.name)?;
+            Version::parse(&component.version)?;
+            if !bundled.insert(&component.name) {
+                return Err(ArcError::InvalidMetadata(format!(
+                    "duplicate bundled component {:?}",
+                    component.name
+                )));
+            }
+        }
 
         validate_unique_requirements("depends", &self.depends, false)?;
         validate_unique_requirements("optdepends", &self.optdepends, false)?;
@@ -228,6 +255,21 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.name, "hello");
         assert!(metadata.depends.is_empty());
+        assert!(!metadata.self_contained);
+    }
+
+    #[test]
+    fn self_contained_and_bundled_metadata_round_trip() {
+        let metadata = Metadata::from_toml(
+            "format = 1\nname = \"git\"\nversion = \"2.55.0-1\"\narch = \"x86_64\"\nself_contained = true\n[[bundled]]\nname = \"openssl\"\nversion = \"3.6.0\"\n",
+        )
+        .unwrap();
+        assert!(metadata.self_contained);
+        assert_eq!(metadata.bundled[0].name, "openssl");
+        assert_eq!(
+            Metadata::from_toml(&metadata.to_toml().unwrap()).unwrap(),
+            metadata
+        );
     }
 
     #[test]

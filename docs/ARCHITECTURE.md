@@ -23,6 +23,7 @@ metadata     package identity and dependency declarations
 version      version ordering and requirement matching
 error        shared error vocabulary and process exit categories
 package      archive inspection, packing, and staged extraction
+runtime_audit safe non-executing ELF and shebang inspection of package roots
 bootstrap    complete-set validation and dependency ordering
 repository   repository index data model
 remote       signed index loading and streaming package downloads

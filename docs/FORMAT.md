@@ -27,6 +27,11 @@ arch = "x86_64"
 description = "A friendly example"
 license = "MIT"
 url = "https://example.test/hello"
+self_contained = true
+
+[[bundled]]
+name = "openssl"
+version = "3.6.0"
 
 depends = ["libc>=1.0"]
 provides = ["greeter=1.0"]
@@ -38,6 +43,11 @@ triggers = ["ldconfig"]
 
 Only `format`, `name`, `version`, and `arch` are required. Unknown keys are an
 error rather than being silently ignored. Array fields default to empty.
+
+`self_contained` defaults to `false`; it records author intent and enables
+strict runtime auditing, but does not alter dependency resolution. `[[bundled]]`
+records internal software for provenance only, not packages Arc must install.
+See [self-contained packages](SELF_CONTAINED_PACKAGES.md).
 
 Package names use lowercase ASCII letters, digits, `+`, `-`, `.`, `_`, and
 `@`. Architectures use lowercase ASCII letters, digits, and `_`; `any` means

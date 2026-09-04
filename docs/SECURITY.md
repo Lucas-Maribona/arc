@@ -70,3 +70,11 @@ not generally reversible; commands should therefore be idempotent.
 Local `install-file` and `bootstrap` archives are not signed. The operator is
 responsible for their provenance. Repository installs authenticate them through
 the signed index.
+
+## Self-contained payloads
+
+Runtime auditing parses untrusted ELF bytes directly and never calls `ldd` or
+executes a package binary. Bundled libraries reduce dependency coupling but can
+duplicate vulnerable components; signed `[[bundled]]` provenance records help
+identify packages that need rebuilding. See
+[self-contained packages](SELF_CONTAINED_PACKAGES.md).

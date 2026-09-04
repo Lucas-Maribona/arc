@@ -258,6 +258,16 @@ pub fn extract(path: &Path, destination: &Path) -> Result<Inspection> {
 }
 
 pub fn pack(source: &Path, output: Option<&Path>) -> Result<PathBuf> {
+    pack_with_options(source, output, false)
+}
+
+/// Pack a tree, auditing self-contained payloads by default. Skipping the
+/// audit is deliberately an explicit caller choice for expert recovery cases.
+pub fn pack_with_options(
+    source: &Path,
+    output: Option<&Path>,
+    skip_runtime_audit: bool,
+) -> Result<PathBuf> {
     let source = source.canonicalize()?;
     if !source.is_dir() {
         return Err(ArcError::Usage(format!(
@@ -269,6 +279,15 @@ pub fn pack(source: &Path, output: Option<&Path>) -> Result<PathBuf> {
     let metadata_path = source.join(METADATA_PATH);
     let metadata_text = fs::read_to_string(&metadata_path)?;
     let metadata = Metadata::from_toml(&metadata_text)?;
+    if metadata.self_contained && !skip_runtime_audit {
+        let report = crate::runtime_audit::audit_root(&source, Some(&metadata))?;
+        if !report.passed() {
+            return Err(ArcError::InvalidMetadata(format!(
+                "self-contained runtime audit failed:\n{}",
+                crate::runtime_audit::format_report(Some(&metadata), &report)
+            )));
+        }
+    }
     let filename = format!(
         "{}-{}-{}.arc",
         metadata.name, metadata.version, metadata.arch

@@ -29,6 +29,7 @@ under `/var/lib/arc/installed`.
   queries.
 - Lifecycle hooks, declarative triggers, system users/groups, and bootstrapping.
 - Local package installs, repository publishing/signing, and Arch conversion.
+- Optional self-contained Mercury payloads with safe non-executing runtime audit.
 
 ## Repository trust and download policy
 
@@ -121,6 +122,7 @@ machine-readable diagnostic without parsing terminal UI text.
 | `remove [--recursive] <package>...` | Remove packages; regular removal protects reverse dependencies and `--recursive` includes dependents. `glibc`, `init`, and `arc` are protected. |
 | `history` | Print committed install/remove transaction records. |
 | `doctor [path]...` | Validate installed state, payload files, repository-cache integrity, and resumable partial downloads. Named paths are also scanned for unowned files. |
+| `bundled <component>` | Find packages declaring an internally bundled component. |
 | `cache list` / `cache clean [--keep <n>]` | List archives, remove all cached archives, or retain the newest `n` authenticated versions of each package. |
 
 ### Package and repository authors
@@ -128,6 +130,7 @@ machine-readable diagnostic without parsing terminal UI text.
 | Command | Purpose |
 | --- | --- |
 | `pack <package-root> [output.arc]` | Build a deterministic package archive. |
+| `audit <package-root>` | Safely inspect prepared ELF runtime requirements and executable shebangs. |
 | `inspect <package.arc>` | Validate and display archive metadata. |
 | `convert-arch <package.pkg.tar.zst> [output.arc]` | Convert a supported Arch package archive. |
 | `repo-index <repository-directory>` | Generate `index.toml` from `packages/`. |
@@ -136,6 +139,9 @@ machine-readable diagnostic without parsing terminal UI text.
 | `version <first> <second>` | Compare arc versions (`-1`, `0`, or `1`). |
 
 Use `arc help`, `arc --help`, or `arc -h` for compact usage.
+
+See [self-contained Mercury packages](docs/SELF_CONTAINED_PACKAGES.md) for
+private runtimes under `/usr/lib/arc/<package>/`, audit policy, and provenance.
 
 ## Package example
 

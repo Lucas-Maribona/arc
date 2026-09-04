@@ -576,6 +576,24 @@ pub fn catalog_info(root: &Path, name: &str) -> Result<Vec<RepositoryPackage>> {
         .collect())
 }
 
+/// Return synchronized package records that declare an internally bundled
+/// component. This is a provenance query, not dependency resolution.
+pub fn catalog_bundled(root: &Path, component: &str) -> Result<Vec<RepositoryPackage>> {
+    validate_name(component)?;
+    let (_, catalog) = load_catalog(root, false)?;
+    Ok(catalog
+        .packages
+        .into_iter()
+        .filter(|package| {
+            package
+                .metadata
+                .bundled
+                .iter()
+                .any(|item| item.name == component)
+        })
+        .collect())
+}
+
 pub fn catalog_group(root: &Path, group: &str) -> Result<Vec<RepositoryPackage>> {
     validate_name(group)?;
     let (_, catalog) = load_catalog(root, false)?;
