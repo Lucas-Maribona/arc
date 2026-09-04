@@ -154,13 +154,13 @@ impl ElfAudit<'_> {
                     "missing runtime requirement: {relative} -> {library}"
                 ));
             }
-            if let Some(resolved) = resolved
-                && self.seen.insert(resolved.clone())
-            {
-                let child = fs::read(&resolved)?;
-                if child.starts_with(b"\x7fELF") {
-                    let child_relative = display_path(self.root, &resolved)?;
-                    self.inspect(&resolved, &child_relative, &child)?;
+            if let Some(resolved) = resolved {
+                if self.seen.insert(resolved.clone()) {
+                    let child = fs::read(&resolved)?;
+                    if child.starts_with(b"\x7fELF") {
+                        let child_relative = display_path(self.root, &resolved)?;
+                        self.inspect(&resolved, &child_relative, &child)?;
+                    }
                 }
             }
         }
