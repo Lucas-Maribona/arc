@@ -1,0 +1,5 @@
+/target/
+*.arc
+*.arc.part-*
+*.sh
+/repo/

@@ -1,0 +1,27 @@
+[package]
+name = "arc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arc = { path = ".." }
+tempfile = "3.27.0"
+
+[[bin]]
+name = "repository_index"
+path = "fuzz_targets/repository_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "package_archive"
+path = "fuzz_targets/package_archive.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+jobs:
+  linux-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update
+      - run: sudo apt-get install --yes musl-tools
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - run: cp target/x86_64-unknown-linux-musl/release/arc arc-x86_64-linux-static
+      - uses: anchore/sbom-action@v0
+        with:
+          artifact-name: arc-x86_64-linux-static
+          output-file: arc-x86_64-linux-static.spdx.json
+          format: spdx-json
+      - run: sha256sum arc-x86_64-linux-static arc-x86_64-linux-static.spdx.json > SHA256SUMS
+      # GitHub signs this provenance with an OIDC identity and publishes it to
+      # the public attestation service; consumers can verify it with gh.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            arc-x86_64-linux-static
+            SHA256SUMS
+            arc-x86_64-linux-static.spdx.json
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            arc-x86_64-linux-static
+            SHA256SUMS
+            arc-x86_64-linux-static.spdx.json

@@ -1,0 +1,27 @@
+[package]
+name = "arc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A small, safe Linux package manager"
+license-file = "LICENSE"
+repository = "https://github.com/Lucas-Maribona/arc"
+readme = "README.md"
+
+[dependencies]
+ed25519-dalek = "2.2.0"
+libc = "0.2"
+getrandom = "0.3.4"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
+rustix = { version = "1.1.4", features = ["process"] }
+tar = "0.4.46"
+tempfile = "3.27.0"
+toml = "1.1.4"
+ureq = { version = "3.1.4", default-features = false, features = ["rustls"] }
+xattr = "1.6.1"
+zstd = "0.13.3"
+
+[profile.release]
+lto = "thin"
+strip = true
