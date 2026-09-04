@@ -118,7 +118,8 @@ impl ElfAudit<'_> {
         }
         if self.self_contained {
             match interpreter.as_deref() {
-                Some(value) => match runtime_path(self.root, path, value) {
+                Some(value) if value.starts_with('/') => match runtime_path(self.root, path, value)
+                {
                     Some(candidate)
                         if resolve_payload_path(self.root, &candidate)
                             .is_ok_and(|target| target.is_file()) => {}
@@ -126,10 +127,16 @@ impl ElfAudit<'_> {
                         "missing or unsafe ELF interpreter: {relative} -> {value}"
                     )),
                 },
-                None if !elf.libraries.is_empty() => self
-                    .report
-                    .problems
-                    .push(format!("dynamic ELF without PT_INTERP: {relative}")),
+                Some(value) => self.report.problems.push(format!(
+                    "missing or unsafe ELF interpreter: {relative} -> {value}"
+                )),
+                None if !elf.libraries.is_empty()
+                    && fs::metadata(path)?.permissions().mode() & 0o111 != 0 =>
+                {
+                    self.report
+                        .problems
+                        .push(format!("dynamic ELF without PT_INTERP: {relative}"))
+                }
                 None => {}
             }
         }
@@ -265,24 +272,50 @@ fn normal(component: Component<'_>) -> Option<PathBuf> {
 /// Resolve a payload path under package-root semantics. Absolute symlink targets
 /// are rooted at the package root, and loops or escapes are rejected.
 fn resolve_payload_path(root: &Path, path: &Path) -> std::result::Result<PathBuf, String> {
-    let initial = path.strip_prefix(root).unwrap_or(path);
-    let mut current = normalize_inside(root, root, initial)
-        .ok_or_else(|| "path escapes package root".to_owned())?;
+    let initial = path
+        .strip_prefix(root)
+        .map_err(|_| "path escapes package root".to_owned())?;
+    let mut pending = initial.to_owned();
     for _ in 0..40 {
-        let metadata = fs::symlink_metadata(&current).map_err(|_| "broken symlink".to_owned())?;
-        if !metadata.file_type().is_symlink() {
+        let normalized = normalize_inside(root, root, &pending)
+            .ok_or_else(|| "path escapes package root".to_owned())?;
+        let relative = normalized
+            .strip_prefix(root)
+            .expect("normalized beneath root");
+        let mut current = root.to_owned();
+        let mut components = relative.components().peekable();
+        let mut followed_link = false;
+        while let Some(component) = components.next() {
+            let Component::Normal(component) = component else {
+                continue;
+            };
+            current.push(component);
+            let metadata =
+                fs::symlink_metadata(&current).map_err(|_| "broken symlink".to_owned())?;
+            if metadata.file_type().is_symlink() {
+                let target =
+                    fs::read_link(&current).map_err(|_| "unreadable symlink".to_owned())?;
+                let base = if target.is_absolute() {
+                    root.to_owned()
+                } else {
+                    current.parent().expect("path beneath root").to_owned()
+                };
+                let mut next = base
+                    .strip_prefix(root)
+                    .expect("path beneath root")
+                    .to_owned();
+                next.push(target.strip_prefix("/").unwrap_or(&target));
+                for remaining in components {
+                    next.push(remaining.as_os_str());
+                }
+                pending = next;
+                followed_link = true;
+                break;
+            }
+        }
+        if !followed_link {
             return Ok(current);
         }
-        let target = fs::read_link(&current).map_err(|_| "unreadable symlink".to_owned())?;
-        let base = if target.is_absolute() {
-            root
-        } else {
-            current
-                .parent()
-                .ok_or_else(|| "invalid symlink parent".to_owned())?
-        };
-        current = normalize_inside(root, base, &target)
-            .ok_or_else(|| "target escapes package root".to_owned())?;
     }
     Err("symlink loop".into())
 }
@@ -493,5 +526,27 @@ mod tests {
                 .0
                 .is_some()
         );
+    }
+
+    #[test]
+    fn symlinked_parent_cannot_escape_package_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/tmp", root.path().join("usr")).unwrap();
+        assert!(resolve_payload_path(root.path(), &root.path().join("usr/file")).is_err());
+    }
+
+    #[test]
+    fn runtime_paths_expand_both_origin_forms() {
+        let root = tempfile::tempdir().unwrap();
+        let object = root.path().join("usr/bin/foo");
+        executable(root.path(), "usr/bin/foo", "x");
+        executable(root.path(), "usr/lib/arc/foo/libx.so", "x");
+        for path in ["$ORIGIN/../lib/arc/foo", "${ORIGIN}/../lib/arc/foo"] {
+            assert!(
+                resolve_library(root.path(), &object, "libx.so", &[path])
+                    .0
+                    .is_some()
+            );
+        }
     }
 }
