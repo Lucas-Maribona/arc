@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
-use goblin::elf::{Elf, program_header::PT_INTERP};
+use goblin::elf::{Elf, header::ET_EXEC, program_header::PT_INTERP};
 
 use crate::error::{ArcError, Result};
 use crate::metadata::Metadata;
@@ -130,13 +130,10 @@ impl ElfAudit<'_> {
                 Some(value) => self.report.problems.push(format!(
                     "missing or unsafe ELF interpreter: {relative} -> {value}"
                 )),
-                None if !elf.libraries.is_empty()
-                    && fs::metadata(path)?.permissions().mode() & 0o111 != 0 =>
-                {
-                    self.report
-                        .problems
-                        .push(format!("dynamic ELF without PT_INTERP: {relative}"))
-                }
+                None if elf.header.e_type == ET_EXEC && !elf.libraries.is_empty() => self
+                    .report
+                    .problems
+                    .push(format!("dynamic ELF without PT_INTERP: {relative}")),
                 None => {}
             }
         }
@@ -477,6 +474,70 @@ mod tests {
         fs::write(&path, text).unwrap();
         fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     }
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    fn program_header(bytes: &mut [u8], index: usize, kind: u32, offset: u64, size: u64) {
+        let base = 64 + index * 56;
+        put_u32(bytes, base, kind);
+        put_u64(bytes, base + 8, offset);
+        put_u64(bytes, base + 16, offset);
+        put_u64(bytes, base + 32, size);
+        put_u64(bytes, base + 40, size);
+    }
+    /// A deterministic ELF64 fixture parsed by the auditor but never executed.
+    fn elf_fixture(kind: u16, needed: &str, runpath: &str, interpreter: Option<&str>) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 1024];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        put_u16(&mut bytes, 16, kind);
+        put_u16(&mut bytes, 18, 62);
+        put_u32(&mut bytes, 20, 1);
+        put_u64(&mut bytes, 32, 64);
+        put_u16(&mut bytes, 52, 64);
+        put_u16(&mut bytes, 54, 56);
+        put_u16(&mut bytes, 56, if interpreter.is_some() { 3 } else { 2 });
+        program_header(&mut bytes, 0, 1, 0, 1024);
+        program_header(&mut bytes, 1, 2, 0x200, 80);
+        if let Some(interpreter) = interpreter {
+            bytes[0x180..0x180 + interpreter.len()].copy_from_slice(interpreter.as_bytes());
+            program_header(
+                &mut bytes,
+                2,
+                PT_INTERP,
+                0x180,
+                (interpreter.len() + 1) as u64,
+            );
+        }
+        let strings = format!("\0{needed}\0{runpath}\0");
+        bytes[0x300..0x300 + strings.len()].copy_from_slice(strings.as_bytes());
+        let mut dynamic = vec![(5_u64, 0x300_u64), (10, strings.len() as u64)];
+        if !needed.is_empty() {
+            dynamic.push((1, 1));
+        }
+        dynamic.push((29, (needed.len() + 2) as u64));
+        dynamic.push((0, 0));
+        for (index, (tag, value)) in dynamic.into_iter().enumerate() {
+            put_u64(&mut bytes, 0x200 + index * 16, tag);
+            put_u64(&mut bytes, 0x208 + index * 16, value);
+        }
+        bytes
+    }
+    fn write_elf(root: &Path, name: &str, bytes: &[u8], mode: u32) {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+    }
+
     #[test]
     fn shell_shebang_is_allowed() {
         let root = tempfile::tempdir().unwrap();
@@ -548,5 +609,38 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn executable_chain_accepts_mode_755_shared_objects_without_interpreters() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = "/usr/lib/arc/foo";
+        write_elf(
+            root.path(),
+            "usr/bin/foo",
+            &elf_fixture(ET_EXEC, "liba.so", runtime, Some("/usr/lib/arc/foo/ld.so")),
+            0o755,
+        );
+        write_elf(
+            root.path(),
+            "usr/lib/arc/foo/liba.so",
+            &elf_fixture(goblin::elf::header::ET_DYN, "libb.so", runtime, None),
+            0o755,
+        );
+        write_elf(
+            root.path(),
+            "usr/lib/arc/foo/libb.so",
+            &elf_fixture(goblin::elf::header::ET_DYN, "", runtime, None),
+            0o755,
+        );
+        executable(root.path(), "usr/lib/arc/foo/ld.so", "loader");
+        let report = audit_root(root.path(), Some(&metadata())).unwrap();
+        assert!(report.passed(), "{:?}", report.problems);
+        assert!(
+            !report
+                .problems
+                .iter()
+                .any(|problem| problem.contains("liba.so") && problem.contains("PT_INTERP"))
+        );
     }
 }
