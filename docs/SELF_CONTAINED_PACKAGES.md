@@ -44,6 +44,18 @@ Run `arc audit <package-root>` before packaging. It parses Linux ELF metadata wi
 
 For `self_contained = true`, missing ELF interpreters and libraries outside the package are failures. Arc does not consult the host `/usr/lib` and does not infer package dependencies from `DT_NEEDED`. `arc pack` runs this audit automatically for self-contained metadata and refuses a failed package. The expert-only `arc pack --skip-runtime-audit ...` bypasses that protection.
 
+Library resolution is deliberately strict: carrying a matching filename under
+`/usr/lib/arc` is not enough. Each ELF object's own RUNPATH (or RPATH when
+RUNPATH is absent) must reach the library through an absolute or
+`$ORIGIN`/`${ORIGIN}` path contained by the package root. This is a
+conservative static model of direct dependencies; Arc does not emulate every
+loader edge case. Absolute symlinks are evaluated relative to the package root,
+never the build host.
+
+For `#!/usr/bin/env python3` and `env -S`, audit requires a bundled
+`/usr/bin/env` and the selected command at `/usr/bin/<command>`. Other env
+option forms are rejected rather than guessed.
+
 Linux kernel/syscall interfaces, `/proc`, `/sys`, `/dev`, filesystem conventions, `/bin/sh`, and declared interaction with system services such as D-Bus are system interfaces rather than ordinary bundled shared libraries.
 
 ## Security response

@@ -1,12 +1,12 @@
-//! Non-executing runtime inspection for prepared package roots.
+//! Safe, non-executing runtime inspection for prepared package roots.
 //!
-//! The parser reads ELF metadata directly; it deliberately never invokes
-//! `ldd`, a loader, or a file from the package being inspected.
+//! This only models package-contained paths. It never invokes a loader, `ldd`,
+//! a payload executable, or consults host library directories.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use goblin::elf::{Elf, program_header::PT_INTERP};
 
@@ -19,38 +19,38 @@ pub struct AuditReport {
     pub scripts: Vec<ScriptReport>,
     pub problems: Vec<String>,
 }
-
 #[derive(Debug)]
 pub struct ElfReport {
     pub path: String,
     pub dynamic: bool,
     pub interpreter: Option<String>,
-    pub needed: Vec<(String, bool)>,
+    pub needed: Vec<LibraryReport>,
     pub rpaths: Vec<String>,
 }
-
+#[derive(Debug)]
+pub struct LibraryReport {
+    pub name: String,
+    pub resolved: Option<String>,
+    pub searched: Vec<String>,
+}
 #[derive(Debug)]
 pub struct ScriptReport {
     pub path: String,
     pub interpreter: String,
 }
-
-struct ElfAudit<'a> {
-    root: &'a Path,
-    libraries: &'a HashMap<String, PathBuf>,
-    self_contained: bool,
-    report: &'a mut AuditReport,
-    seen: &'a mut HashSet<PathBuf>,
-}
-
 impl AuditReport {
     pub fn passed(&self) -> bool {
         self.problems.is_empty()
     }
 }
 
-/// Audit a package tree. `metadata` may be omitted for `arc audit`; when it is
-/// present its self-contained policy is applied.
+struct ElfAudit<'a> {
+    root: &'a Path,
+    self_contained: bool,
+    report: &'a mut AuditReport,
+    seen: &'a mut HashSet<PathBuf>,
+}
+
 pub fn audit_root(root: &Path, metadata: Option<&Metadata>) -> Result<AuditReport> {
     if !root.is_dir() {
         return Err(ArcError::Usage(format!(
@@ -58,27 +58,24 @@ pub fn audit_root(root: &Path, metadata: Option<&Metadata>) -> Result<AuditRepor
             root.display()
         )));
     }
-    let self_contained = metadata.is_some_and(|value| value.self_contained);
     let files = collect_files(root)?;
-    let libraries = library_index(root, &files);
     let mut report = AuditReport::default();
-    let mut seen_elf = HashSet::new();
-    let mut elf_audit = ElfAudit {
+    let mut seen = HashSet::new();
+    let mut audit = ElfAudit {
         root,
-        libraries: &libraries,
-        self_contained,
+        self_contained: metadata.is_some_and(|value| value.self_contained),
         report: &mut report,
-        seen: &mut seen_elf,
+        seen: &mut seen,
     };
     for path in &files {
         let relative = display_path(root, path)?;
         let file_metadata = fs::symlink_metadata(path)?;
         if file_metadata.file_type().is_symlink() {
-            if fs::canonicalize(path).is_err() {
-                elf_audit
+            if let Err(problem) = resolve_payload_path(root, path) {
+                audit
                     .report
                     .problems
-                    .push(format!("broken symlink: {relative}"));
+                    .push(format!("invalid symlink {relative}: {problem}"));
             }
             continue;
         }
@@ -87,9 +84,9 @@ pub fn audit_root(root: &Path, metadata: Option<&Metadata>) -> Result<AuditRepor
         }
         let bytes = fs::read(path)?;
         if bytes.starts_with(b"\x7fELF") {
-            elf_audit.inspect(path, &relative, &bytes)?;
+            audit.inspect(path, &relative, &bytes)?;
         } else if file_metadata.permissions().mode() & 0o111 != 0 && bytes.starts_with(b"#!") {
-            inspect_script(root, path, &relative, &bytes, metadata, elf_audit.report);
+            inspect_script(root, &relative, &bytes, metadata, audit.report);
         }
     }
     Ok(report)
@@ -100,69 +97,68 @@ impl ElfAudit<'_> {
         let elf = Elf::parse(bytes).map_err(|error| {
             ArcError::InvalidArchive(format!("invalid ELF {relative}: {error}"))
         })?;
-        let interpreter = elf
-            .program_headers
+        let interpreter = interpreter(bytes, &elf);
+        // RUNPATH serves this object's direct requirements. Where it is absent,
+        // RPATH does; recursive objects are inspected with their own paths.
+        let paths = if elf.runpaths.is_empty() {
+            &elf.rpaths
+        } else {
+            &elf.runpaths
+        };
+        let rpaths = paths
             .iter()
-            .find(|header| header.p_type == PT_INTERP)
-            .and_then(|header| {
-                let start = usize::try_from(header.p_offset).ok()?;
-                let end = start.checked_add(usize::try_from(header.p_filesz).ok()?)?;
-                bytes
-                    .get(start..end)
-                    .and_then(|raw| raw.split(|byte| *byte == 0).next())
-                    .and_then(|raw| std::str::from_utf8(raw).ok())
-                    .map(str::to_owned)
-            });
-        let mut rpaths = elf
-            .rpaths
-            .iter()
-            .chain(elf.runpaths.iter())
-            .map(|value| (*value).to_owned())
+            .map(|path| (*path).to_owned())
             .collect::<Vec<_>>();
-        rpaths.sort();
-        rpaths.dedup();
-        for rpath in &rpaths {
-            if has_build_path(rpath) {
+        for value in &rpaths {
+            if has_build_path(value) {
                 self.report
                     .problems
-                    .push(format!("build-path RPATH/RUNPATH in {relative}: {rpath}"));
+                    .push(format!("build-path RPATH/RUNPATH in {relative}: {value}"));
             }
         }
         if self.self_contained {
-            if let Some(interpreter) = &interpreter {
-                if !self
-                    .root
-                    .join(interpreter.trim_start_matches('/'))
-                    .is_file()
-                {
-                    self.report.problems.push(format!(
-                        "missing ELF interpreter: {relative} -> {interpreter}"
-                    ));
-                }
-            } else if !elf.libraries.is_empty() {
-                self.report
+            match interpreter.as_deref() {
+                Some(value) => match runtime_path(self.root, path, value) {
+                    Some(candidate)
+                        if resolve_payload_path(self.root, &candidate)
+                            .is_ok_and(|target| target.is_file()) => {}
+                    _ => self.report.problems.push(format!(
+                        "missing or unsafe ELF interpreter: {relative} -> {value}"
+                    )),
+                },
+                None if !elf.libraries.is_empty() => self
+                    .report
                     .problems
-                    .push(format!("dynamic ELF without PT_INTERP: {relative}"));
+                    .push(format!("dynamic ELF without PT_INTERP: {relative}")),
+                None => {}
             }
         }
         let mut needed = Vec::new();
         for library in &elf.libraries {
-            let resolved = resolve_library(self.root, path, library, &rpaths, self.libraries);
-            needed.push(((*library).to_owned(), resolved.is_some()));
+            let (resolved, searched) = resolve_library(self.root, path, library, paths);
             if self.self_contained && resolved.is_none() {
                 self.report.problems.push(format!(
-                    "missing runtime requirement: {relative} -> {library}"
+                    "missing runtime requirement: {relative} -> {library}; searched: {}",
+                    searched.join(", ")
                 ));
             }
-            if let Some(resolved) = resolved {
-                if self.seen.insert(resolved.clone()) {
-                    let child = fs::read(&resolved)?;
+            if let Some(candidate) = &resolved {
+                if self.seen.insert(candidate.clone()) {
+                    let child = fs::read(candidate)?;
                     if child.starts_with(b"\x7fELF") {
-                        let child_relative = display_path(self.root, &resolved)?;
-                        self.inspect(&resolved, &child_relative, &child)?;
+                        let child_relative = display_path(self.root, candidate)?;
+                        self.inspect(candidate, &child_relative, &child)?;
                     }
                 }
             }
+            needed.push(LibraryReport {
+                name: (*library).to_owned(),
+                resolved: resolved
+                    .as_ref()
+                    .and_then(|path| display_path(self.root, path).ok())
+                    .map(|path| format!("/{path}")),
+                searched,
+            });
         }
         self.report.elf.push(ElfReport {
             path: relative.into(),
@@ -175,89 +171,184 @@ impl ElfAudit<'_> {
     }
 }
 
-fn inspect_script(
-    root: &Path,
-    _path: &Path,
-    relative: &str,
-    bytes: &[u8],
-    metadata: Option<&Metadata>,
-    report: &mut AuditReport,
-) {
-    let line = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let command = String::from_utf8_lossy(&line[2..])
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_owned();
-    if command.is_empty() {
-        report.problems.push(format!("invalid shebang: {relative}"));
-        return;
-    }
-    if metadata.is_some_and(|value| value.self_contained)
-        && command != "/bin/sh"
-        && !root.join(command.trim_start_matches('/')).is_file()
-    {
-        report.problems.push(format!(
-            "external script interpreter: {relative} -> {command}"
-        ));
-    }
-    report.scripts.push(ScriptReport {
-        path: relative.into(),
-        interpreter: command,
-    });
+fn interpreter(bytes: &[u8], elf: &Elf<'_>) -> Option<String> {
+    elf.program_headers
+        .iter()
+        .find(|header| header.p_type == PT_INTERP)
+        .and_then(|header| {
+            let start = usize::try_from(header.p_offset).ok()?;
+            let end = start.checked_add(usize::try_from(header.p_filesz).ok()?)?;
+            std::str::from_utf8(bytes.get(start..end)?.split(|byte| *byte == 0).next()?)
+                .ok()
+                .map(str::to_owned)
+        })
 }
 
 fn resolve_library(
     root: &Path,
     object: &Path,
     library: &str,
-    rpaths: &[String],
-    libraries: &HashMap<String, PathBuf>,
-) -> Option<PathBuf> {
-    for entry in rpaths.iter().flat_map(|value| value.split(':')) {
-        let expanded = entry.replace(
-            "$ORIGIN",
-            &object.parent()?.strip_prefix(root).ok()?.to_string_lossy(),
+    paths: &[&str],
+) -> (Option<PathBuf>, Vec<String>) {
+    let mut searched = Vec::new();
+    for entry in paths.iter().flat_map(|path| path.split(':')) {
+        let Some(directory) = runtime_path(root, object, entry) else {
+            searched.push(format!("invalid:{entry}"));
+            continue;
+        };
+        let candidate = directory.join(library);
+        searched.push(
+            display_path(root, &candidate)
+                .map(|path| format!("/{path}"))
+                .unwrap_or_else(|_| format!("invalid:{entry}")),
         );
-        let candidate = if expanded.starts_with('/') {
-            root.join(expanded.trim_start_matches('/'))
-        } else {
-            root.join(expanded)
-        }
-        .join(library);
-        if candidate.is_file() {
-            return Some(candidate);
+        if let Ok(target) = resolve_payload_path(root, &candidate) {
+            if target.is_file() {
+                return (Some(target), searched);
+            }
         }
     }
-    libraries.get(library).cloned()
+    (None, searched)
 }
 
-fn library_index(root: &Path, files: &[PathBuf]) -> HashMap<String, PathBuf> {
-    files
-        .iter()
-        .filter_map(|path| {
-            let relative = path.strip_prefix(root).ok()?;
-            if relative.starts_with("usr/lib/arc") {
-                Some((
-                    path.file_name()?.to_string_lossy().into_owned(),
-                    path.clone(),
-                ))
-            } else {
-                None
+/// Expand an ELF loader path and lexically normalize it within `root`.
+fn runtime_path(root: &Path, object: &Path, value: &str) -> Option<PathBuf> {
+    if value.is_empty() || value.as_bytes().contains(&0) {
+        return None;
+    }
+    let origin = format!("/{}", object.parent()?.strip_prefix(root).ok()?.display());
+    let value = value
+        .replace("${ORIGIN}", &origin)
+        .replace("$ORIGIN", &origin);
+    let base = if value.starts_with('/') {
+        root
+    } else {
+        object.parent()?
+    };
+    normalize_inside(root, base, Path::new(&value))
+}
+
+fn normalize_inside(root: &Path, base: &Path, value: &Path) -> Option<PathBuf> {
+    let mut parts = base
+        .strip_prefix(root)
+        .ok()?
+        .components()
+        .filter_map(normal)
+        .collect::<Vec<_>>();
+    if value.is_absolute() {
+        parts.clear();
+    }
+    for component in value.components() {
+        match component {
+            Component::Normal(value) => parts.push(PathBuf::from(value)),
+            Component::ParentDir => {
+                parts.pop()?;
             }
-        })
-        .collect()
+            Component::CurDir | Component::RootDir => {}
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(
+        parts
+            .into_iter()
+            .fold(root.to_owned(), |path, part| path.join(part)),
+    )
+}
+fn normal(component: Component<'_>) -> Option<PathBuf> {
+    if let Component::Normal(value) = component {
+        Some(PathBuf::from(value))
+    } else {
+        None
+    }
+}
+
+/// Resolve a payload path under package-root semantics. Absolute symlink targets
+/// are rooted at the package root, and loops or escapes are rejected.
+fn resolve_payload_path(root: &Path, path: &Path) -> std::result::Result<PathBuf, String> {
+    let initial = path.strip_prefix(root).unwrap_or(path);
+    let mut current = normalize_inside(root, root, initial)
+        .ok_or_else(|| "path escapes package root".to_owned())?;
+    for _ in 0..40 {
+        let metadata = fs::symlink_metadata(&current).map_err(|_| "broken symlink".to_owned())?;
+        if !metadata.file_type().is_symlink() {
+            return Ok(current);
+        }
+        let target = fs::read_link(&current).map_err(|_| "unreadable symlink".to_owned())?;
+        let base = if target.is_absolute() {
+            root
+        } else {
+            current
+                .parent()
+                .ok_or_else(|| "invalid symlink parent".to_owned())?
+        };
+        current = normalize_inside(root, base, &target)
+            .ok_or_else(|| "target escapes package root".to_owned())?;
+    }
+    Err("symlink loop".into())
+}
+
+fn inspect_script(
+    root: &Path,
+    relative: &str,
+    bytes: &[u8],
+    metadata: Option<&Metadata>,
+    report: &mut AuditReport,
+) {
+    let line = String::from_utf8_lossy(
+        bytes
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default(),
+    );
+    let mut words = line.get(2..).unwrap_or_default().split_whitespace();
+    let Some(interpreter) = words.next() else {
+        report.problems.push(format!("invalid shebang: {relative}"));
+        return;
+    };
+    let command = if interpreter == "/usr/bin/env" {
+        match words.next() {
+            Some("-S") => words.next(),
+            Some(value) if value.starts_with('-') => None,
+            Some(value) => Some(value),
+            None => None,
+        }
+    } else {
+        Some(interpreter)
+    };
+    let Some(command) = command else {
+        report
+            .problems
+            .push(format!("unsupported env shebang: {relative}"));
+        return;
+    };
+    if metadata.is_some_and(|value| value.self_contained) && command != "/bin/sh" {
+        let direct = if interpreter == "/usr/bin/env" {
+            PathBuf::from("usr/bin").join(command)
+        } else {
+            PathBuf::from(command.trim_start_matches('/'))
+        };
+        let env_ok = interpreter != "/usr/bin/env"
+            || resolve_payload_path(root, &root.join("usr/bin/env"))
+                .is_ok_and(|path| path.is_file());
+        if !env_ok
+            || !resolve_payload_path(root, &root.join(direct)).is_ok_and(|path| path.is_file())
+        {
+            report.problems.push(format!(
+                "external script interpreter: {relative} -> {command}"
+            ));
+        }
+    }
+    report.scripts.push(ScriptReport {
+        path: relative.into(),
+        interpreter: command.into(),
+    });
 }
 
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     fn visit(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         for item in fs::read_dir(path)? {
-            let item = item?;
-            let child = item.path();
-            let kind = item.file_type()?;
+            let child = item?.path();
+            let kind = fs::symlink_metadata(&child)?.file_type();
             files.push(child.clone());
             if kind.is_dir() {
                 visit(&child, files)?;
@@ -270,7 +361,6 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     files.sort();
     Ok(files)
 }
-
 fn display_path(root: &Path, path: &Path) -> Result<String> {
     Ok(path
         .strip_prefix(root)
@@ -284,9 +374,11 @@ fn has_build_path(value: &str) -> bool {
         || value.contains("/home/")
         || value.contains("/github/workspace")
         || value.contains("/home/runner/work")
+        || value.starts_with("/workspace")
+        || value.starts_with("/src")
+        || value.starts_with("/builddir")
 }
 
-/// Human-readable output shared by `arc audit` and automatic pack validation.
 pub fn format_report(metadata: Option<&Metadata>, report: &AuditReport) -> String {
     let mut out = String::new();
     if let Some(metadata) = metadata {
@@ -303,18 +395,18 @@ pub fn format_report(metadata: Option<&Metadata>, report: &AuditReport) -> Strin
             elf.path,
             if elf.dynamic { "dynamic" } else { "static" }
         ));
-        if let Some(interpreter) = &elf.interpreter {
-            out.push_str(&format!("    interpreter: {interpreter}\n"));
+        if let Some(value) = &elf.interpreter {
+            out.push_str(&format!("    interpreter: {value}\n"));
         }
-        for (library, bundled) in &elf.needed {
-            out.push_str(&format!(
-                "    {library}: {}\n",
-                if *bundled {
-                    "bundled"
-                } else {
-                    "external/missing"
-                }
-            ));
+        for library in &elf.needed {
+            match &library.resolved {
+                Some(path) => out.push_str(&format!("    {}: bundled -> {path}\n", library.name)),
+                None => out.push_str(&format!(
+                    "    {}: unresolved\n      searched: {}\n",
+                    library.name,
+                    library.searched.join(", ")
+                )),
+            }
         }
     }
     if !report.scripts.is_empty() {
@@ -340,32 +432,66 @@ pub fn format_report(metadata: Option<&Metadata>, report: &AuditReport) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reports_broken_symlinks_without_following_them() {
-        let root = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink("missing", root.path().join("broken")).unwrap();
-        let report = audit_root(root.path(), None).unwrap();
-        assert!(
-            report
-                .problems
-                .iter()
-                .any(|item| item.contains("broken symlink"))
-        );
-    }
-
-    #[test]
-    fn reports_shell_shebang_as_a_narrow_system_interface() {
-        let root = tempfile::tempdir().unwrap();
-        let script = root.path().join("helper");
-        fs::write(&script, b"#!/bin/sh\necho safe\n").unwrap();
-        fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let metadata = Metadata::from_toml(
+    fn metadata() -> Metadata {
+        Metadata::from_toml(
             "format=1\nname=\"test\"\nversion=\"1\"\narch=\"x86_64\"\nself_contained=true\n",
         )
-        .unwrap();
-        let report = audit_root(root.path(), Some(&metadata)).unwrap();
-        assert!(report.passed());
-        assert_eq!(report.scripts[0].interpreter, "/bin/sh");
+        .unwrap()
+    }
+    fn executable(root: &Path, name: &str, text: &str) {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    #[test]
+    fn shell_shebang_is_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        executable(root.path(), "helper", "#!/bin/sh\n");
+        assert!(audit_root(root.path(), Some(&metadata())).unwrap().passed());
+    }
+    #[test]
+    fn direct_and_env_python_require_bundles() {
+        let root = tempfile::tempdir().unwrap();
+        executable(root.path(), "a", "#!/usr/bin/python3\n");
+        executable(root.path(), "b", "#!/usr/bin/env python3\n");
+        let report = audit_root(root.path(), Some(&metadata())).unwrap();
+        assert_eq!(report.problems.len(), 2);
+        executable(root.path(), "usr/bin/python3", "#!/bin/sh\n");
+        executable(root.path(), "usr/bin/env", "#!/bin/sh\n");
+        assert!(audit_root(root.path(), Some(&metadata())).unwrap().passed());
+    }
+    #[test]
+    fn env_split_string_identifies_command() {
+        let root = tempfile::tempdir().unwrap();
+        executable(root.path(), "a", "#!/usr/bin/env -S python3 -u\n");
+        let report = audit_root(root.path(), Some(&metadata())).unwrap();
+        assert!(report.problems[0].contains("python3"));
+    }
+    #[test]
+    fn absolute_symlinks_are_package_rooted_and_escapes_fail() {
+        let root = tempfile::tempdir().unwrap();
+        executable(root.path(), "usr/lib/arc/foo/libx.so", "x");
+        std::os::unix::fs::symlink("/usr/lib/arc/foo/libx.so", root.path().join("link")).unwrap();
+        assert!(audit_root(root.path(), Some(&metadata())).unwrap().passed());
+        std::os::unix::fs::symlink("../../outside", root.path().join("bad")).unwrap();
+        assert!(!audit_root(root.path(), Some(&metadata())).unwrap().passed());
+    }
+    #[test]
+    fn runtime_paths_do_not_fallback_by_basename() {
+        let root = tempfile::tempdir().unwrap();
+        let object = root.path().join("usr/bin/foo");
+        executable(root.path(), "usr/bin/foo", "x");
+        executable(root.path(), "usr/lib/arc/foo/libx.so", "x");
+        assert!(
+            resolve_library(root.path(), &object, "libx.so", &[])
+                .0
+                .is_none()
+        );
+        assert!(
+            resolve_library(root.path(), &object, "libx.so", &["$ORIGIN/../lib/arc/foo"])
+                .0
+                .is_some()
+        );
     }
 }
